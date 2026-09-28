@@ -35,8 +35,20 @@ export function generateRandomRoomId() {
 }
 
 /**
- * Default WebSocket Server URL.
- * Defaults to ws://localhost:1234 or environment variable.
+ * Resolves the WebSocket Server URL.
+ * Checks for a `ws` query parameter first (e.g. ?ws=ws://localhost:1235),
+ * falling back to the existing VITE_WS_URL environment variable or ws://localhost:1234.
  */
-export const DEFAULT_WS_SERVER_URL =
-  import.meta.env.VITE_WS_URL || 'ws://localhost:1234';
+export function getWsServerUrl() {
+  if (typeof window !== 'undefined') {
+    const params = new URLSearchParams(window.location.search);
+    const queryWs = params.get('ws');
+    if (queryWs && queryWs.trim()) {
+      return queryWs.trim();
+    }
+  }
+  return import.meta.env.VITE_WS_URL || 'ws://localhost:1234';
+}
+
+export const DEFAULT_WS_SERVER_URL = getWsServerUrl();
+

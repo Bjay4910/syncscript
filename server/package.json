@@ -12,6 +12,7 @@
   "description": "",
   "dependencies": {
     "dotenv": "^18.0.4",
+    "ioredis": "^6.0.0",
     "lib0": "^0.2.118",
     "pg": "^8.23.0",
     "ws": "^8.22.0",

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import pg from 'pg';
+import Redis from 'ioredis';
 import * as Y from 'yjs';
 import * as syncProtocol from 'y-protocols/sync';
 import * as awarenessProtocol from 'y-protocols/awareness';
@@ -22,6 +23,14 @@ const MESSAGE_QUERY_AWARENESS = 3;
  */
 let pool = null;
 let dbConnected = false;
+
+/**
+ * Dedicated Redis pub/sub connections and state.
+ * Hard Redis requirement: a single connection cannot both publish and subscribe.
+ */
+let redisPub = null;
+let redisSub = null;
+let redisConnected = false;
 
 /**
  * Initialize PostgreSQL connection, handle errors gracefully,
@@ -72,6 +81,127 @@ async function setupDatabase() {
     console.error('❌ [Postgres Connection Error] Could not connect to Postgres on startup:', err.message);
     console.warn('⚠️  [Persistence Degraded] Document editing will work in-memory, but changes will not be saved.');
   }
+}
+
+/**
+ * Initialize separate Redis publisher and subscriber connections.
+ */
+function setupRedis() {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) {
+    console.warn('⚠️  [Redis Warning] REDIS_URL is not set in environment. Cross-instance pub/sub is disabled.');
+    return;
+  }
+
+  try {
+    redisPub = new Redis(redisUrl, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      retryStrategy(times) {
+        return Math.min(times * 100, 3000);
+      },
+    });
+
+    redisSub = new Redis(redisUrl, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      retryStrategy(times) {
+        return Math.min(times * 100, 3000);
+      },
+    });
+
+    redisPub.on('error', (err) => {
+      console.error('[Redis Pub Error]:', err.message);
+    });
+
+    redisSub.on('error', (err) => {
+      console.error('[Redis Sub Error]:', err.message);
+    });
+
+    redisPub.on('connect', () => {
+      console.log('📡 [Redis Pub] Connected to Redis publisher.');
+    });
+
+    redisSub.on('connect', () => {
+      console.log('📡 [Redis Sub] Connected to Redis subscriber.');
+      redisConnected = true;
+
+      // Resubscribe all active rooms when subscriber connects or reconnects
+      for (const roomName of rooms.keys()) {
+        subscribeRoomToRedis(roomName);
+      }
+    });
+
+    // Handle incoming binary messages from Redis pub/sub
+    redisSub.on('messageBuffer', (channelBuf, messageBuf) => {
+      const channel = channelBuf.toString();
+      const roomPrefix = 'syncscript:room:';
+      const awarenessPrefix = 'syncscript:awareness:';
+
+      if (channel.startsWith(roomPrefix)) {
+        const roomName = channel.slice(roomPrefix.length);
+        const room = rooms.get(roomName);
+        if (!room) return;
+
+        console.log(`[Redis Sub] Room: "${roomName}" | Type: sync`);
+        const update = new Uint8Array(messageBuf.buffer, messageBuf.byteOffset, messageBuf.byteLength);
+        // Apply with origin 'redis' so it triggers local client broadcast but skips republishing to Redis
+        Y.applyUpdate(room.doc, update, 'redis');
+      } else if (channel.startsWith(awarenessPrefix)) {
+        const roomName = channel.slice(awarenessPrefix.length);
+        const room = rooms.get(roomName);
+        if (!room) return;
+
+        console.log(`[Redis Sub] Room: "${roomName}" | Type: awareness`);
+        const update = new Uint8Array(messageBuf.buffer, messageBuf.byteOffset, messageBuf.byteLength);
+        // Apply with origin 'redis' so it triggers local client broadcast but skips republishing to Redis
+        awarenessProtocol.applyAwarenessUpdate(room.awareness, update, 'redis');
+      }
+    });
+  } catch (err) {
+    console.error('❌ [Redis Error] Failed to initialize Redis:', err.message);
+  }
+}
+
+/**
+ * Subscribe Redis subscriber to a room's document and awareness channels.
+ * @param {string} roomName
+ */
+function subscribeRoomToRedis(roomName) {
+  if (!redisSub) return;
+  const docChannel = `syncscript:room:${roomName}`;
+  const awarenessChannel = `syncscript:awareness:${roomName}`;
+  redisSub.subscribe(docChannel, awarenessChannel, (err) => {
+    if (err) {
+      console.error(`[Redis Subscribe Error] Room "${roomName}":`, err.message);
+    }
+  });
+}
+
+/**
+ * Publish raw Yjs update to room's Redis channel.
+ * @param {string} roomName
+ * @param {Uint8Array} update
+ */
+function publishSyncToRedis(roomName, update) {
+  if (!redisPub) return;
+  console.log(`[Redis Pub] Room: "${roomName}" | Type: sync`);
+  redisPub.publish(`syncscript:room:${roomName}`, Buffer.from(update)).catch((err) => {
+    console.error(`[Redis Publish Error] Room "${roomName}":`, err.message);
+  });
+}
+
+/**
+ * Publish raw awareness update to room's Redis channel.
+ * @param {string} roomName
+ * @param {Uint8Array} awarenessUpdate
+ */
+function publishAwarenessToRedis(roomName, awarenessUpdate) {
+  if (!redisPub) return;
+  console.log(`[Redis Pub] Room: "${roomName}" | Type: awareness`);
+  redisPub.publish(`syncscript:awareness:${roomName}`, Buffer.from(awarenessUpdate)).catch((err) => {
+    console.error(`[Redis Awareness Publish Error] Room "${roomName}":`, err.message);
+  });
 }
 
 /**
@@ -217,40 +347,54 @@ class Room {
     this.persistQueue = Promise.resolve();
     this.initPromise = null;
 
-    // Relay document updates to all other clients in this room
+    // Relay document updates to all other clients in this room and to Redis
     this.doc.on('update', (update, origin) => {
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, MESSAGE_SYNC);
       syncProtocol.writeUpdate(encoder, update);
       const message = encoding.toUint8Array(encoder);
 
+      // 1. Broadcast to local WebSocket clients (reusing existing local broadcast logic)
       for (const client of this.clients) {
         if (client !== origin && client.readyState === WebSocket.OPEN) {
           send(client, message);
         }
       }
 
-      // Persist update to Postgres if not loaded from persistence
-      if (origin !== 'persistence') {
+      // 2. Persist update to Postgres if not loaded from persistence and not from Redis
+      // (The origin instance where the client submitted the edit handles DB persistence)
+      if (origin !== 'persistence' && origin !== 'redis') {
         persistUpdate(this, update);
+      }
+
+      // 3. Publish to Redis channel if update did not originate from Redis or DB persistence
+      if (origin !== 'redis' && origin !== 'persistence') {
+        publishSyncToRedis(this.name, update);
       }
     });
 
-    // Relay awareness updates (presence, cursors, user info) to peers
+    // Relay awareness updates (presence, cursors, user info) to local peers and to Redis
     this.awareness.on('update', ({ added, updated, removed }, origin) => {
       const changedClients = added.concat(updated).concat(removed);
+      if (changedClients.length === 0) return;
+
+      const awarenessUpdate = awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients);
+
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
-      encoding.writeVarUint8Array(
-        encoder,
-        awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients)
-      );
+      encoding.writeVarUint8Array(encoder, awarenessUpdate);
       const message = encoding.toUint8Array(encoder);
 
+      // 1. Broadcast to local WebSocket clients
       for (const client of this.clients) {
         if (client !== origin && client.readyState === WebSocket.OPEN) {
           send(client, message);
         }
+      }
+
+      // 2. Publish awareness update to Redis if not originating from Redis
+      if (origin !== 'redis') {
+        publishAwarenessToRedis(this.name, awarenessUpdate);
       }
     });
   }
@@ -260,7 +404,7 @@ class Room {
 const rooms = new Map();
 
 /**
- * Retrieve or create a room by name, ensuring DB state is loaded on initial creation.
+ * Retrieve or create a room by name, ensuring DB state is loaded and Redis subscribed.
  * @param {string} roomName
  * @returns {Promise<Room>}
  */
@@ -270,6 +414,7 @@ async function getOrCreateRoom(roomName) {
     room = new Room(roomName);
     rooms.set(roomName, room);
     room.initPromise = loadRoomFromDb(room);
+    subscribeRoomToRedis(roomName);
   }
   if (room.initPromise) {
     await room.initPromise;
@@ -284,7 +429,9 @@ const server = http.createServer((req, res) => {
     JSON.stringify({
       service: 'syncscript-server',
       status: 'healthy',
+      port: PORT,
       persistence: dbConnected ? 'connected' : 'degraded',
+      redis: redisConnected ? 'connected' : 'disabled',
       activeRooms: rooms.size,
       rooms: Array.from(rooms.keys()),
     })
@@ -453,8 +600,9 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-// Initialize database tables, then start listening
+// Initialize database tables & Redis pub/sub, then start listening
 await setupDatabase();
+setupRedis();
 
 server.listen(PORT, () => {
   console.log(`🚀 SyncScript WebSocket Server listening on http://localhost:${PORT} (ws://localhost:${PORT}/<roomId>)`);

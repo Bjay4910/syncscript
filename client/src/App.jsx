@@ -8,7 +8,7 @@ import JoinModal from './components/JoinModal';
 import {
   getRandomUserColor,
   generateRandomRoomId,
-  DEFAULT_WS_SERVER_URL,
+  getWsServerUrl,
 } from './constants';
 
 function CollaborativeSession({ roomId, currentUser }) {
@@ -20,8 +20,9 @@ function CollaborativeSession({ roomId, currentUser }) {
     const ydoc = new Y.Doc();
     // 1. Initialize IndexedDB persistence immediately on mount (before WebSocket connects)
     const idbPersistence = new IndexeddbPersistence(roomId, ydoc);
-    // 2. WebSocket provider for real-time sync with server
-    const wsProvider = new WebsocketProvider(DEFAULT_WS_SERVER_URL, roomId, ydoc);
+    // 2. WebSocket provider for real-time sync with server (supports ?ws=ws://localhost:1235 query override)
+    const wsServerUrl = getWsServerUrl();
+    const wsProvider = new WebsocketProvider(wsServerUrl, roomId, ydoc);
 
     // Register user awareness state
     wsProvider.awareness.setLocalStateField('user', {
