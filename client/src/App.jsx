@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import { IndexeddbPersistence } from 'y-indexeddb';
 import Header from './components/Header';
 import Editor from './components/Editor';
 import JoinModal from './components/JoinModal';
@@ -14,9 +15,12 @@ function CollaborativeSession({ roomId, currentUser }) {
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [users, setUsers] = useState([]);
 
-  // Create Yjs document and WebSocket provider tied to this room and user
-  const { doc, provider } = useMemo(() => {
+  // Create Yjs document, IndexedDB persistence for offline support, and WebSocket provider
+  const { doc, provider, persistence } = useMemo(() => {
     const ydoc = new Y.Doc();
+    // 1. Initialize IndexedDB persistence immediately on mount (before WebSocket connects)
+    const idbPersistence = new IndexeddbPersistence(roomId, ydoc);
+    // 2. WebSocket provider for real-time sync with server
     const wsProvider = new WebsocketProvider(DEFAULT_WS_SERVER_URL, roomId, ydoc);
 
     // Register user awareness state
@@ -26,7 +30,7 @@ function CollaborativeSession({ roomId, currentUser }) {
       colorLight: currentUser.colorLight,
     });
 
-    return { doc: ydoc, provider: wsProvider };
+    return { doc: ydoc, provider: wsProvider, persistence: idbPersistence };
   }, [roomId, currentUser]);
 
   // Clean up provider and document when unmounting or switching rooms
@@ -52,18 +56,82 @@ function CollaborativeSession({ roomId, currentUser }) {
     provider.awareness.on('change', updateUsersFromAwareness);
     updateUsersFromAwareness();
 
+    let syncTimer = null;
+    let syncStartTime = 0;
+
+    // Handle WebSocket status transitions: connecting, connected (syncing handshake), offline
     const handleStatus = ({ status }) => {
-      setConnectionStatus(status);
+      if (status === 'connected') {
+        if (provider.synced) {
+          setConnectionStatus('connected');
+        } else {
+          syncStartTime = Date.now();
+          setConnectionStatus('syncing');
+        }
+      } else if (status === 'connecting') {
+        setConnectionStatus('connecting');
+      } else if (status === 'disconnected') {
+        setConnectionStatus('offline');
+      }
     };
+
+    // Handle Yjs sync handshake completion
+    const handleSync = (isSynced) => {
+      if (isSynced) {
+        // Guarantee brief visual visibility for "Syncing..." on fast connections
+        const elapsed = syncStartTime > 0 ? Date.now() - syncStartTime : 400;
+        const remainingDelay = Math.max(0, 350 - elapsed);
+        if (syncTimer) clearTimeout(syncTimer);
+        syncTimer = setTimeout(() => {
+          if (provider.wsconnected && provider.synced) {
+            setConnectionStatus('connected');
+          }
+        }, remainingDelay);
+      } else if (provider.wsconnected) {
+        syncStartTime = Date.now();
+        setConnectionStatus('syncing');
+      }
+    };
+
     provider.on('status', handleStatus);
+    provider.on('sync', handleSync);
+
+    // Real network drop listeners (browser offline / online)
+    const handleWindowOffline = () => {
+      setConnectionStatus('offline');
+    };
+    const handleWindowOnline = () => {
+      if (provider.shouldReconnect) {
+        provider.connect();
+      }
+    };
+
+    window.addEventListener('offline', handleWindowOffline);
+    window.addEventListener('online', handleWindowOnline);
 
     return () => {
+      if (syncTimer) clearTimeout(syncTimer);
+      window.removeEventListener('offline', handleWindowOffline);
+      window.removeEventListener('online', handleWindowOnline);
       provider.awareness.off('change', updateUsersFromAwareness);
       provider.off('status', handleStatus);
+      provider.off('sync', handleSync);
       provider.destroy();
+      persistence.destroy();
       doc.destroy();
     };
-  }, [doc, provider]);
+  }, [doc, provider, persistence]);
+
+  // Deterministic manual offline / online toggle
+  const handleToggleOffline = () => {
+    if (connectionStatus === 'offline') {
+      provider.connect();
+      setConnectionStatus('connecting');
+    } else {
+      provider.disconnect();
+      setConnectionStatus('offline');
+    }
+  };
 
   return (
     <div className="app-wrapper">
@@ -72,10 +140,11 @@ function CollaborativeSession({ roomId, currentUser }) {
         connectionStatus={connectionStatus}
         users={users}
         currentClientId={doc.clientID}
+        onToggleOffline={handleToggleOffline}
       />
 
       <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <Editor ydoc={doc} provider={provider} />
+        <Editor ydoc={doc} provider={provider} roomId={roomId} persistence={persistence} />
       </main>
     </div>
   );

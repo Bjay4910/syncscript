@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FileText, Copy, Check, Share2 } from 'lucide-react';
+import { FileText, Copy, Check, Share2, Wifi, WifiOff } from 'lucide-react';
 import PresenceBar from './PresenceBar';
 
 export default function Header({
@@ -7,6 +7,7 @@ export default function Header({
   connectionStatus,
   users,
   currentClientId,
+  onToggleOffline,
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -18,13 +19,20 @@ export default function Header({
     });
   };
 
-  // Format connection status label
+  // Format connection status details across 4 distinct states
   const getStatusDetails = () => {
     switch (connectionStatus) {
       case 'connected':
+      case 'synced':
         return {
           label: 'Connected',
           className: 'status-connected',
+          icon: <span className="status-dot" />,
+        };
+      case 'syncing':
+        return {
+          label: 'Syncing...',
+          className: 'status-syncing',
           icon: <span className="status-dot" />,
         };
       case 'connecting':
@@ -33,17 +41,19 @@ export default function Header({
           className: 'status-connecting',
           icon: <span className="status-dot" />,
         };
+      case 'offline':
       case 'disconnected':
       default:
         return {
-          label: 'Disconnected',
-          className: 'status-disconnected',
+          label: 'Offline — editing locally',
+          className: 'status-offline',
           icon: <span className="status-dot" />,
         };
     }
   };
 
   const status = getStatusDetails();
+  const isOffline = connectionStatus === 'offline' || connectionStatus === 'disconnected';
 
   return (
     <header className="app-header">
@@ -73,8 +83,29 @@ export default function Header({
         {/* Presence Bar showing active peers */}
         <PresenceBar users={users} currentClientId={currentClientId} />
 
+        {/* Deterministic Go Offline / Go Online Toggle Button */}
+        <button
+          onClick={onToggleOffline}
+          className={`btn-offline-toggle ${isOffline ? 'is-offline' : ''}`}
+          id="toggle-offline-button"
+          title={isOffline ? 'Connect to server (Go Online)' : 'Disconnect from server (Go Offline)'}
+          aria-label={isOffline ? 'Go Online' : 'Go Offline'}
+        >
+          {isOffline ? (
+            <>
+              <Wifi size={14} />
+              <span>Go Online</span>
+            </>
+          ) : (
+            <>
+              <WifiOff size={14} />
+              <span>Go Offline</span>
+            </>
+          )}
+        </button>
+
         {/* Connection status indicator */}
-        <div className={`connection-status ${status.className}`}>
+        <div className={`connection-status ${status.className}`} id="connection-status-badge">
           {status.icon}
           <span>{status.label}</span>
         </div>
@@ -101,3 +132,4 @@ export default function Header({
     </header>
   );
 }
+

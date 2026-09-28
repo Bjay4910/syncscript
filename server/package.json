@@ -11,7 +11,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "dotenv": "^18.0.4",
     "lib0": "^0.2.118",
+    "pg": "^8.23.0",
     "ws": "^8.22.0",
     "y-protocols": "^1.0.7",
     "yjs": "^13.6.33"

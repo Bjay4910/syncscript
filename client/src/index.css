@@ -241,6 +241,8 @@ body {
 
 .status-connected {
   color: #10b981;
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.28);
 }
 
 .status-connected .status-dot {
@@ -262,6 +264,8 @@ body {
 
 .status-connecting {
   color: #f59e0b;
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.28);
 }
 
 .status-connecting .status-dot {
@@ -269,18 +273,81 @@ body {
   animation: blink 1.2s infinite;
 }
 
-.status-disconnected {
-  color: #ef4444;
+.status-syncing {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.1);
+  border-color: rgba(251, 191, 36, 0.35);
 }
 
+.status-syncing .status-dot {
+  background-color: #fbbf24;
+  box-shadow: 0 0 8px #fbbf24;
+  animation: pulse-sync 1s infinite;
+}
+
+.status-offline,
+.status-disconnected {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.28);
+}
+
+.status-offline .status-dot,
 .status-disconnected .status-dot {
-  background-color: var(--status-disconnected);
+  background-color: #ef4444;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.5);
 }
 
 @keyframes pulse-ring {
   0% { transform: scale(1); opacity: 0.8; }
   70% { transform: scale(1.8); opacity: 0; }
   100% { transform: scale(1.8); opacity: 0; }
+}
+
+@keyframes pulse-sync {
+  0% { transform: scale(0.9); opacity: 0.7; }
+  50% { transform: scale(1.2); opacity: 1; }
+  100% { transform: scale(0.9); opacity: 0.7; }
+}
+
+/* Offline / Online Toggle Button */
+.btn-offline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.8rem;
+  border-radius: var(--radius-full);
+  font-size: 0.78rem;
+  font-weight: 500;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  user-select: none;
+}
+
+.btn-offline-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--border-medium);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+
+.btn-offline-toggle:active {
+  transform: translateY(0);
+}
+
+.btn-offline-toggle.is-offline {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #34d399;
+}
+
+.btn-offline-toggle.is-offline:hover {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.55);
+  color: #6ee7b7;
 }
 
 @keyframes blink {

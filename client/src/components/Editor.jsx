@@ -3,15 +3,22 @@ import { EditorState } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
 import { yCollab } from 'y-codemirror.next';
 import * as Y from 'yjs';
-import { Activity } from 'lucide-react';
+import { IndexeddbPersistence } from 'y-indexeddb';
+import { Activity, HardDrive } from 'lucide-react';
 
-export default function Editor({ ydoc, provider }) {
+export default function Editor({ ydoc, provider, roomId, persistence: passedPersistence }) {
   const editorContainerRef = useRef(null);
   const viewRef = useRef(null);
   const [stats, setStats] = useState({ chars: 0, words: 0, lines: 1 });
 
   useEffect(() => {
     if (!editorContainerRef.current || !ydoc || !provider) return;
+
+    // Ensure IndexeddbPersistence is active
+    let localPersistence = null;
+    if (!passedPersistence && roomId) {
+      localPersistence = new IndexeddbPersistence(roomId, ydoc);
+    }
 
     // Get the shared Y.Text type for the document
     const ytext = ydoc.getText('codemirror');
@@ -98,10 +105,13 @@ export default function Editor({ ydoc, provider }) {
     view.focus();
 
     return () => {
+      if (localPersistence) {
+        localPersistence.destroy();
+      }
       view.destroy();
       viewRef.current = null;
     };
-  }, [ydoc, provider]);
+  }, [ydoc, provider, roomId, passedPersistence]);
 
   return (
     <div className="editor-workspace">
@@ -125,12 +135,22 @@ export default function Editor({ ydoc, provider }) {
             </span>
           </div>
 
-          <div className="footer-crdt-badge" title="Changes conflict-free synced via Yjs CRDT">
-            <Activity size={12} color="#10b981" />
-            <span>CRDT Synced</span>
+          <div className="footer-crdt-badge" title="Local IndexedDB caching + Yjs conflict-free CRDT">
+            {provider?.wsconnected ? (
+              <>
+                <Activity size={12} color="#10b981" />
+                <span>CRDT Synced</span>
+              </>
+            ) : (
+              <>
+                <HardDrive size={12} color="#38bdf8" />
+                <span>Local IndexedDB</span>
+              </>
+            )}
           </div>
         </div>
       </div>
     </div>
   );
 }
+
