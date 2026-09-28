@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment variables (secrets, DB credentials, etc.)
+.env
+.env.local
+
+# Editor/OS junk
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Antigravity IDE task logs (from earlier debugging)
+task-*.log
