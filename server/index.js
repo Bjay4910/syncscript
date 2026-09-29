@@ -15,6 +15,10 @@ const EVICTION_TIMEOUT_MS = parseInt(
   process.env.ROOM_EVICTION_TIMEOUT_MS || `${10 * 60 * 1000}`,
   10
 );
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env.HEARTBEAT_INTERVAL_MS || '30000',
+  10
+);
 
 // Protocol message types matching y-protocols / y-websocket specifications
 const MESSAGE_SYNC = 0;
@@ -495,12 +499,31 @@ function clearAllEvictionTimers() {
 }
 
 /**
+ * Strict regex matching 21-character URL-safe room IDs (nanoid specification):
+ * Exactly 21 characters from the alphabet: 0-9, A-Z, a-z, _, -
+ */
+const ROOM_ID_REGEX = /^[0-9A-Za-z_-]{21}$/;
+
+/**
+ * Validates whether a room ID matches the exact shape generateRandomRoomId() produces.
+ * @param {string} roomId
+ * @returns {boolean}
+ */
+function isValidRoomId(roomId) {
+  return typeof roomId === 'string' && ROOM_ID_REGEX.test(roomId);
+}
+
+/**
  * Retrieve or create a room by name, ensuring DB state is loaded and Redis subscribed.
  * If room already existed in memory with a pending eviction timer, cancels the timer.
  * @param {string} roomName
  * @returns {Promise<Room>}
  */
 async function getOrCreateRoom(roomName) {
+  if (!isValidRoomId(roomName)) {
+    throw new Error(`Invalid room ID: "${roomName}"`);
+  }
+
   let room = rooms.get(roomName);
   if (!room) {
     room = new Room(roomName);
@@ -525,6 +548,7 @@ async function getOrCreateRoom(roomName) {
  * @returns {boolean}
  */
 function isNameTakenInRoom(roomName, targetName) {
+  if (!isValidRoomId(roomName)) return false;
   const room = rooms.get(roomName);
   if (!room) return false;
 
@@ -571,6 +595,17 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    if (!isValidRoomId(roomName.trim())) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: 'Invalid room ID: must be a 21-character secure identifier',
+        })
+      );
+      return;
+    }
+
     const taken = isNameTakenInRoom(roomName.trim(), name.trim());
     if (taken) {
       res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -599,19 +634,69 @@ const server = http.createServer((req, res) => {
       redis: redisConnected ? 'connected' : 'disabled',
       activeRooms: rooms.size,
       rooms: Array.from(rooms.keys()),
+      roomDetails: Array.from(rooms.entries()).map(([name, r]) => ({
+        name,
+        clients: r.clients.size,
+        evictionPending: r.evictionTimer !== null,
+      })),
     })
   );
 });
 
 const wss = new WebSocketServer({ server });
 
+/**
+ * Server-wide heartbeat interval:
+ * Runs periodically to detect dead/unresponsive WebSocket connections.
+ * For each connected client:
+ * - If ws.isAlive === false (client did not respond to the last ping), terminates connection.
+ * - Otherwise sets ws.isAlive = false and sends a ping (ws.ping()).
+ * ws.terminate() forcibly closes the underlying socket and emits the 'close' event,
+ * correctly triggering the existing cleanup logic (room.clients, awareness, room eviction timer).
+ */
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('[Heartbeat] Terminating unresponsive/dead WebSocket client');
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {
+      ws.terminate();
+    }
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+// Allow Node process to exit cleanly if only heartbeat timer remains
+if (typeof heartbeatInterval.unref === 'function') {
+  heartbeatInterval.unref();
+}
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
+});
+
 wss.on('connection', async (ws, req) => {
+  // Standard WebSocket heartbeat: mark client alive on connection and upon each pong response
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
   // Extract room name and optional display name from the URL path/query:
   // e.g. ws://localhost:1234/<roomId>?name=Alice
   const parsedUrl = new URL(req.url || '/', 'http://localhost');
   const pathSegment = parsedUrl.pathname.replace(/^\/+|\/+$/g, '');
-  const roomName = decodeURIComponent(pathSegment) || 'default-room';
+  const roomName = decodeURIComponent(pathSegment);
   const requestedName = parsedUrl.searchParams.get('name');
+
+  // Enforce strict format check on room name (must be a valid 21-character URL-safe ID)
+  if (!isValidRoomId(roomName)) {
+    console.warn(`[Reject] WebSocket connection rejected for invalid room ID: "${roomName}"`);
+    ws.close(4400, 'Invalid room ID');
+    return;
+  }
 
   // Buffer messages arriving before room is initialized
   const earlyMessages = [];
@@ -811,16 +896,19 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-// Clean process shutdown handlers: clear any pending eviction timers
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, clearing pending eviction timers.');
+// Clean process shutdown handlers: clear any pending eviction timers and heartbeat interval
+function gracefulShutdown(signal) {
+  console.log(`Received ${signal}, clearing pending eviction timers and heartbeat interval.`);
+  clearInterval(heartbeatInterval);
   clearAllEvictionTimers();
-});
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 1000).unref();
+}
 
-process.on('SIGINT', () => {
-  console.log('Received SIGINT, clearing pending eviction timers.');
-  clearAllEvictionTimers();
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Initialize database tables & Redis pub/sub, then start listening
 await setupDatabase();
