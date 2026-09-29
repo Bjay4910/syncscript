@@ -9,9 +9,10 @@ import {
   getRandomUserColor,
   generateRandomRoomId,
   getWsServerUrl,
+  getHttpServerUrl,
 } from './constants';
 
-function CollaborativeSession({ roomId, currentUser }) {
+function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [users, setUsers] = useState([]);
 
@@ -22,7 +23,9 @@ function CollaborativeSession({ roomId, currentUser }) {
     const idbPersistence = new IndexeddbPersistence(roomId, ydoc);
     // 2. WebSocket provider for real-time sync with server (supports ?ws=ws://localhost:1235 query override)
     const wsServerUrl = getWsServerUrl();
-    const wsProvider = new WebsocketProvider(wsServerUrl, roomId, ydoc);
+    const wsProvider = new WebsocketProvider(wsServerUrl, roomId, ydoc, {
+      params: { name: currentUser.name },
+    });
 
     // Register user awareness state
     wsProvider.awareness.setLocalStateField('user', {
@@ -94,8 +97,18 @@ function CollaborativeSession({ roomId, currentUser }) {
       }
     };
 
+    // Listen for permanent close event (e.g. code 4409 if server rejected due to race condition)
+    const handleClosed = (closeEvent) => {
+      if (closeEvent && (closeEvent.code === 4409 || closeEvent.code === 4001)) {
+        if (onNameConflict) {
+          onNameConflict(closeEvent.reason || 'That name is already in use in this room — please choose another');
+        }
+      }
+    };
+
     provider.on('status', handleStatus);
     provider.on('sync', handleSync);
+    provider.on('closed', handleClosed);
 
     // Real network drop listeners (browser offline / online)
     const handleWindowOffline = () => {
@@ -117,11 +130,12 @@ function CollaborativeSession({ roomId, currentUser }) {
       provider.awareness.off('change', updateUsersFromAwareness);
       provider.off('status', handleStatus);
       provider.off('sync', handleSync);
+      provider.off('closed', handleClosed);
       provider.destroy();
       persistence.destroy();
       doc.destroy();
     };
-  }, [doc, provider, persistence]);
+  }, [doc, provider, persistence, onNameConflict]);
 
   // Deterministic manual offline / online toggle
   const handleToggleOffline = () => {
@@ -179,8 +193,32 @@ export default function App() {
 
   const [joined, setJoined] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
+  const [joinError, setJoinError] = useState('');
 
-  const handleJoin = (name) => {
+  const handleJoin = async (name) => {
+    setJoinError('');
+
+    // 1. Live name-uniqueness check against server awareness before joining
+    try {
+      const httpUrl = getHttpServerUrl();
+      const checkUrl = `${httpUrl}/check-name?room=${encodeURIComponent(roomId)}&name=${encodeURIComponent(name)}&_t=${Date.now()}`;
+      const res = await fetch(checkUrl, { cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.taken || !data.ok) {
+        const errorMsg = data.error || 'That name is already in use in this room — please choose another';
+        return { ok: false, error: errorMsg };
+      }
+    } catch (err) {
+      console.warn('[Name Check Warning] Could not reach server for pre-check:', err.message);
+      // Hard gate: Never fall through to join session on pre-check failure or abort
+      return {
+        ok: false,
+        error: 'Unable to verify display name availability. Please try again.',
+      };
+    }
+
+    // 2. Name is available: assign color and enter session
     const colorObj = getRandomUserColor();
     const user = {
       name,
@@ -189,11 +227,24 @@ export default function App() {
     };
     setCurrentUser(user);
     setJoined(true);
+    return { ok: true };
+  };
+
+  const handleNameConflict = (errorMsg) => {
+    setJoinError(errorMsg);
+    setJoined(false);
+    setCurrentUser(null);
   };
 
   if (!joined || !currentUser) {
-    return <JoinModal roomId={roomId} onJoin={handleJoin} />;
+    return <JoinModal roomId={roomId} onJoin={handleJoin} initialError={joinError} />;
   }
 
-  return <CollaborativeSession roomId={roomId} currentUser={currentUser} />;
+  return (
+    <CollaborativeSession
+      roomId={roomId}
+      currentUser={currentUser}
+      onNameConflict={handleNameConflict}
+    />
+  );
 }

@@ -1,12 +1,24 @@
 import React, { useState } from 'react';
 import { User, ArrowRight, FileText, Info } from 'lucide-react';
 
-export default function JoinModal({ roomId, onJoin }) {
+export default function JoinModal({ roomId, onJoin, initialError = '' }) {
   const [name, setName] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialError);
+  const [prevInitialError, setPrevInitialError] = useState(initialError);
+  const [lastTakenName, setLastTakenName] = useState('');
+  const [isChecking, setIsChecking] = useState(false);
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
+  if (initialError !== prevInitialError) {
+    setPrevInitialError(initialError);
+    setError(initialError);
+  }
+
+  const handleSubmit = async (e) => {
+    if (e && e.preventDefault) {
+      e.preventDefault();
+    }
+    if (isChecking) return;
+
     const trimmed = name.trim();
 
     if (!trimmed) {
@@ -19,7 +31,28 @@ export default function JoinModal({ roomId, onJoin }) {
       return;
     }
 
-    onJoin(trimmed);
+    // If this exact name was already verified taken, keep error and block immediately
+    if (lastTakenName && trimmed.toLowerCase() === lastTakenName.toLowerCase()) {
+      setError('That name is already in use in this room — please choose another');
+      return;
+    }
+
+    setError('');
+    setIsChecking(true);
+
+    try {
+      const res = await onJoin(trimmed);
+      if (!res || !res.ok) {
+        setLastTakenName(trimmed);
+        setError(res?.error || 'That name is already in use in this room — please choose another');
+        return;
+      }
+      setLastTakenName('');
+    } catch (err) {
+      setError(err?.message || 'Unable to verify name. Please try again.');
+    } finally {
+      setIsChecking(false);
+    }
   };
 
   const handleChange = (e) => {
@@ -27,6 +60,9 @@ export default function JoinModal({ roomId, onJoin }) {
     if (val.length <= 30) {
       setName(val);
       if (error) setError('');
+      if (lastTakenName && val.trim().toLowerCase() !== lastTakenName.toLowerCase()) {
+        setLastTakenName('');
+      }
     }
   };
 
@@ -85,8 +121,14 @@ export default function JoinModal({ roomId, onJoin }) {
             {error && <p className="join-error-msg">{error}</p>}
           </div>
 
-          <button type="submit" className="btn-primary" id="join-room-btn">
-            <span>Join Document</span>
+          <button
+            type="submit"
+            className="btn-primary"
+            id="join-room-btn"
+            disabled={isChecking}
+            onClick={handleSubmit}
+          >
+            <span>{isChecking ? 'Checking availability...' : 'Join Document'}</span>
             <ArrowRight size={16} />
           </button>
 

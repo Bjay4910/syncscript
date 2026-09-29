@@ -11,6 +11,10 @@ import * as decoding from 'lib0/decoding';
 
 const { Pool } = pg;
 const PORT = parseInt(process.env.PORT || '1234', 10);
+const EVICTION_TIMEOUT_MS = parseInt(
+  process.env.ROOM_EVICTION_TIMEOUT_MS || `${10 * 60 * 1000}`,
+  10
+);
 
 // Protocol message types matching y-protocols / y-websocket specifications
 const MESSAGE_SYNC = 0;
@@ -174,6 +178,23 @@ function subscribeRoomToRedis(roomName) {
   redisSub.subscribe(docChannel, awarenessChannel, (err) => {
     if (err) {
       console.error(`[Redis Subscribe Error] Room "${roomName}":`, err.message);
+    }
+  });
+}
+
+/**
+ * Unsubscribe Redis subscriber from a room's document and awareness channels.
+ * @param {string} roomName
+ */
+function unsubscribeRoomFromRedis(roomName) {
+  if (!redisSub) return;
+  const docChannel = `syncscript:room:${roomName}`;
+  const awarenessChannel = `syncscript:awareness:${roomName}`;
+  redisSub.unsubscribe(docChannel, awarenessChannel, (err) => {
+    if (err) {
+      console.error(`[Redis Unsubscribe Error] Room "${roomName}":`, err.message);
+    } else {
+      console.log(`📡 [Redis Sub] Unsubscribed from channels for room: "${roomName}"`);
     }
   });
 }
@@ -346,6 +367,7 @@ class Room {
     this.clients = new Set();
     this.persistQueue = Promise.resolve();
     this.initPromise = null;
+    this.evictionTimer = null;
 
     // Relay document updates to all other clients in this room and to Redis
     this.doc.on('update', (update, origin) => {
@@ -404,7 +426,77 @@ class Room {
 const rooms = new Map();
 
 /**
+ * Schedules eviction for an empty room after the grace period.
+ * If clients reconnect before the timer fires, eviction is cancelled.
+ * @param {Room} room
+ */
+function scheduleRoomEviction(room) {
+  cancelRoomEviction(room);
+
+  console.log(`⏱️  [Eviction Scheduled] Room "${room.name}" empty. Eviction scheduled in ${EVICTION_TIMEOUT_MS}ms.`);
+
+  room.evictionTimer = setTimeout(async () => {
+    // Re-verify room still has zero active clients
+    if (room.clients.size > 0) {
+      console.log(`[Eviction Aborted] Room "${room.name}" re-acquired active clients before timer expired.`);
+      room.evictionTimer = null;
+      return;
+    }
+
+    try {
+      // 1. Wait for any queued database operations to settle
+      await room.persistQueue;
+
+      // 2. Remove room from in-memory Map
+      rooms.delete(room.name);
+
+      // 3. Unsubscribe shared Redis subscriber from channels
+      unsubscribeRoomFromRedis(room.name);
+
+      // 4. Destroy in-memory Awareness and Y.Doc to free memory
+      room.awareness.destroy();
+      room.doc.destroy();
+
+      room.evictionTimer = null;
+      console.log(`🧹 [Eviction] Room "${room.name}" evicted from memory. (Active rooms: ${rooms.size})`);
+    } catch (err) {
+      console.error(`[Eviction Error] Failed during eviction of room "${room.name}":`, err.message);
+    }
+  }, EVICTION_TIMEOUT_MS);
+
+  // Unref timer so it doesn't keep Node process alive if otherwise idle
+  if (room.evictionTimer && typeof room.evictionTimer.unref === 'function') {
+    room.evictionTimer.unref();
+  }
+}
+
+/**
+ * Cancels any pending eviction timer for a room (e.g. when a client connects).
+ * @param {Room} room
+ */
+function cancelRoomEviction(room) {
+  if (room.evictionTimer) {
+    clearTimeout(room.evictionTimer);
+    room.evictionTimer = null;
+    console.log(`[Eviction Cancelled] Room "${room.name}" has active client. Eviction timer cancelled.`);
+  }
+}
+
+/**
+ * Clears all pending eviction timers across all rooms on process shutdown.
+ */
+function clearAllEvictionTimers() {
+  for (const room of rooms.values()) {
+    if (room.evictionTimer) {
+      clearTimeout(room.evictionTimer);
+      room.evictionTimer = null;
+    }
+  }
+}
+
+/**
  * Retrieve or create a room by name, ensuring DB state is loaded and Redis subscribed.
+ * If room already existed in memory with a pending eviction timer, cancels the timer.
  * @param {string} roomName
  * @returns {Promise<Room>}
  */
@@ -415,6 +507,9 @@ async function getOrCreateRoom(roomName) {
     rooms.set(roomName, room);
     room.initPromise = loadRoomFromDb(room);
     subscribeRoomToRedis(roomName);
+  } else {
+    // Room exists: cancel pending eviction timer since a client is accessing it
+    cancelRoomEviction(room);
   }
   if (room.initPromise) {
     await room.initPromise;
@@ -422,8 +517,78 @@ async function getOrCreateRoom(roomName) {
   return room;
 }
 
-// Create HTTP server for health checks and WebSocket upgrading
+/**
+ * Checks whether a display name is already in use by another connected client in that same room.
+ * Reuses the in-memory room.awareness tracking (no database table needed).
+ * @param {string} roomName
+ * @param {string} targetName
+ * @returns {boolean}
+ */
+function isNameTakenInRoom(roomName, targetName) {
+  const room = rooms.get(roomName);
+  if (!room) return false;
+
+  const normalized = targetName.trim().toLowerCase();
+  const states = room.awareness.getStates();
+
+  for (const [, state] of states.entries()) {
+    if (state && state.user && typeof state.user.name === 'string') {
+      if (state.user.name.trim().toLowerCase() === normalized) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Create HTTP server for health checks, name-uniqueness checks, and WebSocket upgrading
 const server = http.createServer((req, res) => {
+  // CORS headers so Vite client (port 5173) can query name availability
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Cache-Control, Pragma');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  // Live name-uniqueness check per room
+  if (parsedUrl.pathname === '/check-name') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const roomName = parsedUrl.searchParams.get('room') || '';
+    const name = parsedUrl.searchParams.get('name') || '';
+
+    if (!roomName.trim() || !name.trim()) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Missing room or name parameter' }));
+      return;
+    }
+
+    const taken = isNameTakenInRoom(roomName.trim(), name.trim());
+    if (taken) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          taken: true,
+          error: 'That name is already in use in this room — please choose another',
+        })
+      );
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, taken: false, available: true }));
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(
     JSON.stringify({
@@ -441,10 +606,12 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', async (ws, req) => {
-  // Extract room name from the URL path: e.g. ws://localhost:1234/<roomId>
+  // Extract room name and optional display name from the URL path/query:
+  // e.g. ws://localhost:1234/<roomId>?name=Alice
   const parsedUrl = new URL(req.url || '/', 'http://localhost');
   const pathSegment = parsedUrl.pathname.replace(/^\/+|\/+$/g, '');
   const roomName = decodeURIComponent(pathSegment) || 'default-room';
+  const requestedName = parsedUrl.searchParams.get('name');
 
   // Buffer messages arriving before room is initialized
   const earlyMessages = [];
@@ -469,6 +636,16 @@ wss.on('connection', async (ws, req) => {
   if (ws.readyState !== WebSocket.OPEN) {
     return;
   }
+
+  // Live name-uniqueness verification at WebSocket connection handshake
+  if (requestedName && isNameTakenInRoom(roomName, requestedName)) {
+    console.warn(`[Reject] Name "${requestedName}" is already taken in room "${roomName}"`);
+    ws.close(4409, 'That name is already in use in this room — please choose another');
+    return;
+  }
+
+  // Cancel any pending eviction timer when a new client connects
+  cancelRoomEviction(room);
 
   room.clients.add(ws);
 
@@ -526,18 +703,47 @@ wss.on('connection', async (ws, req) => {
         case MESSAGE_AWARENESS: {
           const update = decoding.readVarUint8Array(decoder);
 
-          // Track client IDs in this update so we can immediately clean them up upon disconnect
+          // Track client IDs in this update and reject awareness updates claiming a taken name
+          let nameConflict = false;
           try {
             const updateDecoder = decoding.createDecoder(update);
             const len = decoding.readVarUint(updateDecoder);
             for (let i = 0; i < len; i++) {
               const clientID = decoding.readVarUint(updateDecoder);
               decoding.readVarUint(updateDecoder); // clock
-              decoding.readVarString(updateDecoder); // JSON state string
+              const stateStr = decoding.readVarString(updateDecoder); // JSON state string
               controlledUserIds.add(clientID);
+
+              if (stateStr) {
+                try {
+                  const parsedState = JSON.parse(stateStr);
+                  if (parsedState?.user?.name && typeof parsedState.user.name === 'string') {
+                    const claimedName = parsedState.user.name.trim().toLowerCase();
+                    const existingStates = room.awareness.getStates();
+                    for (const [existingId, existingState] of existingStates.entries()) {
+                      if (
+                        existingId !== clientID &&
+                        existingState?.user?.name &&
+                        existingState.user.name.trim().toLowerCase() === claimedName
+                      ) {
+                        nameConflict = true;
+                        break;
+                      }
+                    }
+                  }
+                } catch {
+                  // Ignore JSON parse error on non-user awareness states
+                }
+              }
             }
           } catch (decodeErr) {
             console.warn('[Awareness Decode Warning]:', decodeErr.message);
+          }
+
+          if (nameConflict) {
+            console.warn(`[Reject] Awareness name conflict detected in room "${roomName}"`);
+            ws.close(4409, 'That name is already in use in this room — please choose another');
+            break;
           }
 
           awarenessProtocol.applyAwarenessUpdate(room.awareness, update, ws);
@@ -593,11 +799,27 @@ wss.on('connection', async (ws, req) => {
     }
 
     console.log(`[Disconnect] Room: "${roomName}" | Active clients: ${room.clients.size}`);
+
+    // If no clients remain in the room, schedule eviction after grace period
+    if (room.clients.size === 0) {
+      scheduleRoomEviction(room);
+    }
   });
 
   ws.on('error', (err) => {
     console.error(`[Socket Error] Room: "${roomName}":`, err.message);
   });
+});
+
+// Clean process shutdown handlers: clear any pending eviction timers
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, clearing pending eviction timers.');
+  clearAllEvictionTimers();
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, clearing pending eviction timers.');
+  clearAllEvictionTimers();
 });
 
 // Initialize database tables & Redis pub/sub, then start listening

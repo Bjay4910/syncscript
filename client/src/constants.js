@@ -23,15 +23,31 @@ export function getRandomUserColor() {
 }
 
 /**
- * Generates a clean, friendly document room ID if none was specified.
+ * Generates a cryptographically secure, high-entropy room ID (21 characters, 126 bits of entropy).
+ * Uses crypto.getRandomValues with a 64-character URL-safe alphabet (nanoid specification),
+ * rendering room IDs infeasible to guess or brute-force.
  */
 export function generateRandomRoomId() {
-  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-  let result = 'doc-';
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_';
+  const size = 21;
+  const bytes = new Uint8Array(size);
+
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < size; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
   }
-  return result;
+
+  let id = '';
+  for (let i = 0; i < size; i++) {
+    // 64-character alphabet: bitwise AND with 63 provides uniform distribution without modulo bias
+    id += alphabet[bytes[i] & 63];
+  }
+  return id;
 }
 
 /**
@@ -47,7 +63,15 @@ export function getWsServerUrl() {
       return queryWs.trim();
     }
   }
-  return import.meta.env.VITE_WS_URL || 'ws://localhost:1234';
+  return import.meta.env?.VITE_WS_URL || 'ws://localhost:1234';
+}
+
+/**
+ * Resolves the HTTP Server URL corresponding to the WebSocket Server URL.
+ */
+export function getHttpServerUrl() {
+  const wsUrl = getWsServerUrl();
+  return wsUrl.replace(/^ws:\/\//i, 'http://').replace(/^wss:\/\//i, 'https://');
 }
 
 export const DEFAULT_WS_SERVER_URL = getWsServerUrl();
