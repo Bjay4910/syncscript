@@ -567,8 +567,9 @@ function isNameTakenInRoom(roomName, targetName) {
 
 // Create HTTP server for health checks, name-uniqueness checks, and WebSocket upgrading
 const server = http.createServer((req, res) => {
-  // CORS headers so Vite client (port 5173) can query name availability
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // CORS headers so web client can query name availability (supports optional CORS_ORIGIN env var)
+  const allowedOrigin = process.env.CORS_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Cache-Control, Pragma');
 

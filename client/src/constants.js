@@ -54,24 +54,42 @@ export function generateRandomRoomId() {
  * Resolves the WebSocket Server URL.
  * Checks for a `ws` query parameter first (e.g. ?ws=ws://localhost:1235),
  * falling back to the existing VITE_WS_URL environment variable or ws://localhost:1234.
+ * Automatically normalizes scheme (http/https -> ws/wss) and strips trailing slashes.
  */
 export function getWsServerUrl() {
+  let url = '';
   if (typeof window !== 'undefined') {
     const params = new URLSearchParams(window.location.search);
     const queryWs = params.get('ws');
     if (queryWs && queryWs.trim()) {
-      return queryWs.trim();
+      url = queryWs.trim();
     }
   }
-  return import.meta.env?.VITE_WS_URL || 'ws://localhost:1234';
+
+  if (!url) {
+    url = (import.meta.env?.VITE_WS_URL || '').trim();
+  }
+
+  if (!url) {
+    url = 'ws://localhost:1234';
+  }
+
+  // Normalize: strip trailing slashes and convert any http(s) scheme to ws(s)
+  url = url.replace(/\/+$/, '');
+  url = url.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
+  return url;
 }
 
 /**
  * Resolves the HTTP Server URL corresponding to the WebSocket Server URL.
+ * Converts ws:// -> http:// and wss:// -> https://, and ensures no trailing slash.
  */
 export function getHttpServerUrl() {
   const wsUrl = getWsServerUrl();
-  return wsUrl.replace(/^ws:\/\//i, 'http://').replace(/^wss:\/\//i, 'https://');
+  return wsUrl
+    .replace(/^ws:\/\//i, 'http://')
+    .replace(/^wss:\/\//i, 'https://')
+    .replace(/\/+$/, '');
 }
 
 export const DEFAULT_WS_SERVER_URL = getWsServerUrl();

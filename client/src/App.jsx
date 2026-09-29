@@ -97,11 +97,11 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
       }
     };
 
-    // Listen for permanent close event (e.g. code 4409 if server rejected due to race condition)
+    // Listen for permanent close event (e.g. code 4409 for name conflict, 4400 for invalid room ID)
     const handleClosed = (closeEvent) => {
-      if (closeEvent && (closeEvent.code === 4409 || closeEvent.code === 4001)) {
+      if (closeEvent && (closeEvent.code === 4409 || closeEvent.code === 4400 || closeEvent.code === 4001)) {
         if (onNameConflict) {
-          onNameConflict(closeEvent.reason || 'That name is already in use in this room — please choose another');
+          onNameConflict(closeEvent.reason || 'Connection rejected by server');
         }
       }
     };
