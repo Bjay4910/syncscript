@@ -19,7 +19,7 @@ export default function Header({
     });
   };
 
-  // Format connection status details across 4 distinct states
+  // Format connection status details across distinct states (including Render cold-start)
   const getStatusDetails = () => {
     switch (connectionStatus) {
       case 'connected':
@@ -34,6 +34,13 @@ export default function Header({
           label: 'Syncing...',
           className: 'status-syncing',
           icon: <span className="status-dot" />,
+        };
+      case 'waking-up':
+        return {
+          label: 'Waking up the server — this can take up to a minute',
+          className: 'status-waking-up',
+          icon: <span className="status-dot" />,
+          tooltip: 'Render free-tier instances sleep when inactive. Waking up can take 30–50 seconds.',
         };
       case 'connecting':
         return {
@@ -105,7 +112,11 @@ export default function Header({
         </button>
 
         {/* Connection status indicator */}
-        <div className={`connection-status ${status.className}`} id="connection-status-badge">
+        <div
+          className={`connection-status ${status.className}`}
+          id="connection-status-badge"
+          title={status.tooltip || status.label}
+        >
           {status.icon}
           <span>{status.label}</span>
         </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
@@ -12,9 +12,20 @@ import {
   getHttpServerUrl,
 } from './constants';
 
+// Cold-start threshold: 3500ms before switching initial connection attempt to "waking-up"
+const COLD_START_DELAY_MS = parseInt(
+  import.meta.env?.VITE_COLD_START_DELAY_MS || '3500',
+  10
+);
+
 function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [users, setUsers] = useState([]);
+
+  // Track initial connection lifecycle to distinguish cold starts from later offline/reconnect events
+  const hasEverConnectedRef = useRef(false);
+  const isWakingUpRef = useRef(false);
+  const coldStartTimerRef = useRef(null);
 
   // Create Yjs document, IndexedDB persistence for offline support, and WebSocket provider
   const { doc, provider, persistence } = useMemo(() => {
@@ -39,6 +50,19 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
 
   // Clean up provider and document when unmounting or switching rooms
   useEffect(() => {
+    // Start cold-start delay timer on initial load:
+    // If connection hasn't completed within COLD_START_DELAY_MS, switch to "waking-up"
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setConnectionStatus('offline');
+    } else {
+      coldStartTimerRef.current = setTimeout(() => {
+        if (!hasEverConnectedRef.current && !provider.wsconnected && !provider.synced) {
+          isWakingUpRef.current = true;
+          setConnectionStatus('waking-up');
+        }
+      }, COLD_START_DELAY_MS);
+    }
+
     // Helper to update active users list from awareness
     const updateUsersFromAwareness = () => {
       const states = provider.awareness.getStates();
@@ -63,25 +87,48 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
     let syncTimer = null;
     let syncStartTime = 0;
 
-    // Handle WebSocket status transitions: connecting, connected (syncing handshake), offline
+    // Handle WebSocket status transitions: connecting, connected (syncing handshake), offline, waking-up
     const handleStatus = ({ status }) => {
       if (status === 'connected') {
+        if (coldStartTimerRef.current) {
+          clearTimeout(coldStartTimerRef.current);
+          coldStartTimerRef.current = null;
+        }
         if (provider.synced) {
+          hasEverConnectedRef.current = true;
+          isWakingUpRef.current = false;
           setConnectionStatus('connected');
         } else {
           syncStartTime = Date.now();
           setConnectionStatus('syncing');
         }
       } else if (status === 'connecting') {
-        setConnectionStatus('connecting');
+        // If we're waiting during initial cold start, maintain the calm waking-up state
+        if (!hasEverConnectedRef.current && isWakingUpRef.current) {
+          setConnectionStatus('waking-up');
+        } else {
+          setConnectionStatus('connecting');
+        }
       } else if (status === 'disconnected') {
-        setConnectionStatus('offline');
+        // Suppress the alarming "Offline" flicker during cold start while Render boots
+        if (!hasEverConnectedRef.current && isWakingUpRef.current) {
+          setConnectionStatus('waking-up');
+        } else {
+          setConnectionStatus('offline');
+        }
       }
     };
 
     // Handle Yjs sync handshake completion
     const handleSync = (isSynced) => {
       if (isSynced) {
+        if (coldStartTimerRef.current) {
+          clearTimeout(coldStartTimerRef.current);
+          coldStartTimerRef.current = null;
+        }
+        hasEverConnectedRef.current = true;
+        isWakingUpRef.current = false;
+
         // Guarantee brief visual visibility for "Syncing..." on fast connections
         const elapsed = syncStartTime > 0 ? Date.now() - syncStartTime : 400;
         const remainingDelay = Math.max(0, 350 - elapsed);
@@ -100,6 +147,11 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
     // Listen for permanent close event (e.g. code 4409 for name conflict, 4400 for invalid room ID)
     const handleClosed = (closeEvent) => {
       if (closeEvent && (closeEvent.code === 4409 || closeEvent.code === 4400 || closeEvent.code === 4001)) {
+        if (coldStartTimerRef.current) {
+          clearTimeout(coldStartTimerRef.current);
+          coldStartTimerRef.current = null;
+        }
+        isWakingUpRef.current = false;
         if (onNameConflict) {
           onNameConflict(closeEvent.reason || 'Connection rejected by server');
         }
@@ -112,6 +164,11 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
 
     // Real network drop listeners (browser offline / online)
     const handleWindowOffline = () => {
+      if (coldStartTimerRef.current) {
+        clearTimeout(coldStartTimerRef.current);
+        coldStartTimerRef.current = null;
+      }
+      isWakingUpRef.current = false;
       setConnectionStatus('offline');
     };
     const handleWindowOnline = () => {
@@ -124,6 +181,7 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
     window.addEventListener('online', handleWindowOnline);
 
     return () => {
+      if (coldStartTimerRef.current) clearTimeout(coldStartTimerRef.current);
       if (syncTimer) clearTimeout(syncTimer);
       window.removeEventListener('offline', handleWindowOffline);
       window.removeEventListener('online', handleWindowOnline);
@@ -143,6 +201,11 @@ function CollaborativeSession({ roomId, currentUser, onNameConflict }) {
       provider.connect();
       setConnectionStatus('connecting');
     } else {
+      if (coldStartTimerRef.current) {
+        clearTimeout(coldStartTimerRef.current);
+        coldStartTimerRef.current = null;
+      }
+      isWakingUpRef.current = false;
       provider.disconnect();
       setConnectionStatus('offline');
     }

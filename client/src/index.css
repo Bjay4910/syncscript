@@ -285,6 +285,18 @@ body {
   animation: pulse-sync 1s infinite;
 }
 
+.status-waking-up {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.status-waking-up .status-dot {
+  background-color: #f59e0b;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+  animation: pulse-sync 1.5s infinite;
+}
+
 .status-offline,
 .status-disconnected {
   color: #f87171;
