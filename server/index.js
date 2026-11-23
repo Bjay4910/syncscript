@@ -634,12 +634,6 @@ const server = http.createServer((req, res) => {
       persistence: dbConnected ? 'connected' : 'degraded',
       redis: redisConnected ? 'connected' : 'disabled',
       activeRooms: rooms.size,
-      rooms: Array.from(rooms.keys()),
-      roomDetails: Array.from(rooms.entries()).map(([name, r]) => ({
-        name,
-        clients: r.clients.size,
-        evictionPending: r.evictionTimer !== null,
-      })),
     })
   );
 });
